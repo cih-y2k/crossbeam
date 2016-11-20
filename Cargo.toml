@@ -8,8 +8,16 @@ documentation = "http://aturon.github.io/crossbeam-doc/crossbeam/"
 readme = "README.md"
 license = "Apache-2.0/MIT"
 
+[dependencies]
+time = "0.1"
+fnv = "1.0.5"
+rand = "0.3"
+
 [features]
 nightly = []
 
 [dev-dependencies]
 rand = "0.3"
+
+[profile.release]
+debug = true

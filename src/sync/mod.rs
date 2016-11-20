@@ -1,5 +1,4 @@
 //! Synchronization primitives.
-
 pub use self::ms_queue::MsQueue;
 pub use self::atomic_option::AtomicOption;
 pub use self::treiber_stack::TreiberStack;
@@ -12,3 +11,4 @@ mod treiber_stack;
 mod seg_queue;
 pub mod chase_lev;
 mod arc_cell;
+pub mod hash_table;

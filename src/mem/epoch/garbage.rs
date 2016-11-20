@@ -10,6 +10,7 @@ use std::ptr;
 use std::mem;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering::{Relaxed, Release, Acquire};
+use std::fmt;
 
 use mem::ZerosValid;
 
@@ -23,12 +24,17 @@ struct Item {
 }
 
 /// A single, thread-local bag of garbage.
-#[derive(Debug)]
-pub struct Bag(Vec<Item>);
+pub struct Bag(Vec<Item>, Vec<Box<FnMut()>>);
+
+impl fmt::Debug for Bag {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Bag({:?}, <{} funs>)", self.0, self.1.len())
+    }
+}
 
 impl Bag {
     fn new() -> Bag {
-        Bag(vec![])
+        Bag(vec![], vec![])
     }
 
     fn insert<T>(&mut self, elem: *mut T) {
@@ -44,12 +50,20 @@ impl Bag {
         }
     }
 
+    fn register_fn(&mut self, f: Box<FnMut()>) {
+        self.1.push(f)
+    }
+
     fn len(&self) -> usize {
-        self.0.len()
+        self.0.len() + self.1.len()
     }
 
     /// Deallocate all garbage in the bag
     pub unsafe fn collect(&mut self) {
+        let mut funcs = mem::replace(&mut self.1, Vec::new());
+        for func in funcs.iter_mut() {
+            func()
+        }
         let mut data = mem::replace(&mut self.0, Vec::new());
         for item in data.iter() {
             (item.free)(item.ptr);
@@ -81,6 +95,10 @@ impl Local {
             cur: Bag::new(),
             new: Bag::new(),
         }
+    }
+
+    pub fn register_fn(&mut self, f: Box<FnMut()>) {
+        self.new.register_fn(f)
     }
 
     pub fn insert<T>(&mut self, elem: *mut T) {
@@ -117,13 +135,17 @@ struct Node {
 }
 
 impl ConcBag {
-    pub fn insert(&self, t: Bag){
-        let n = Box::into_raw(Box::new(
-            Node { data: t, next: AtomicPtr::new(ptr::null_mut()) }));
+    pub fn insert(&self, t: Bag) {
+        let n = Box::into_raw(Box::new(Node {
+            data: t,
+            next: AtomicPtr::new(ptr::null_mut()),
+        }));
         loop {
             let head = self.head.load(Acquire);
             unsafe { (*n).next.store(head, Relaxed) };
-            if self.head.compare_and_swap(head, n, Release) == head { break }
+            if self.head.compare_and_swap(head, n, Release) == head {
+                break;
+            }
         }
     }
 
@@ -141,4 +163,25 @@ impl ConcBag {
             }
         }
     }
+
+    /*
+    pub unsafe fn collect(&self) {
+        // check to avoid xchg instruction
+        // when no garbage exists
+        let mut v = Vec::new();
+        let mut head = self.head.load(Relaxed);
+        if head != ptr::null_mut() {
+            head = self.head.swap(ptr::null_mut(), Acquire);
+
+            while head != ptr::null_mut() {
+                v.push(Box::from_raw(head));
+                // n.data.collect();
+                head = head.as_ref().unwrap().next.load(Relaxed);
+            }
+        }
+        while let Some(mut n) = v.pop() {
+            n.data.collect();
+        }
+    }
+    */
 }

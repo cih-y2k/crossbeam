@@ -128,7 +128,7 @@
 
 mod atomic;
 mod garbage;
-mod global;
+pub mod global;
 mod guard;
 mod local;
 mod participant;
@@ -198,7 +198,7 @@ impl<'a, T> Deref for Shared<'a, T> {
 }
 
 impl<'a, T> Shared<'a, T> {
-    unsafe fn from_raw(raw: *mut T) -> Option<Shared<'a, T>> {
+    pub unsafe fn from_raw(raw: *mut T) -> Option<Shared<'a, T>> {
         if raw == ptr::null_mut() { None }
         else {
             Some(Shared {
@@ -207,7 +207,7 @@ impl<'a, T> Shared<'a, T> {
         }
     }
 
-    unsafe fn from_ref(r: &T) -> Shared<'a, T> {
+    pub unsafe fn from_ref(r: &T) -> Shared<'a, T> {
         Shared { data: mem::transmute(r) }
     }
 

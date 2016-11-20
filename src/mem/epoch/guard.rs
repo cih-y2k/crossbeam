@@ -43,9 +43,17 @@ impl Guard {
         local::with_participant(|p| p.reclaim(val.as_raw()))
     }
 
+    pub unsafe fn destructor(&self, bf: Box<FnMut()>){
+        local::with_participant(|p| p.register_callback(bf))
+    }
+
     /// Move the thread-local garbage into the global set of garbage.
     pub fn migrate_garbage(&self) {
         local::with_participant(|p| p.migrate_garbage())
+    }
+
+    pub fn quiesced_collect(&self) -> bool {
+        local::with_participant(|p| p.try_collect(&self))
     }
 }
 

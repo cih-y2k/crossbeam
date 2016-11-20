@@ -11,7 +11,7 @@ use super::{Owned, Shared, Guard};
 /// the `Owned` and `Shared` types.
 #[derive(Debug)]
 pub struct Atomic<T> {
-    ptr: atomic::AtomicPtr<T>,
+    pub ptr: atomic::AtomicPtr<T>,
     _marker: PhantomData<*const ()>,
 }
 

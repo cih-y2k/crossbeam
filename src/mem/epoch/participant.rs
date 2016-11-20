@@ -86,6 +86,10 @@ impl Participant {
         (*self.garbage.get()).insert(data);
     }
 
+    pub unsafe fn register_callback(&self, f: Box<FnMut()>) {
+        (*self.garbage.get()).register_fn(f);
+    }
+
     /// Attempt to collect garbage by moving the global epoch forward.
     ///
     /// Returns `true` on success.
