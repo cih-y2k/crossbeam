@@ -313,29 +313,6 @@ unsafe fn delete_set<'a, K: Eq + Hash + Clone, V>(bucket: &LazySet<K, V>, guard:
     }
 }
 
-impl<K: Eq + Hash + Clone + Debug, V: Clone + Debug> HashTable<K, V> {
-    /// debugging routine that prints the internal layout of `self`.
-    pub fn dbg_print_main(&self) {
-        let guard = epoch::pin();
-        let print_bucket_array = |buckets: &Atomic<Vec<LazySet<K, V>>>| {
-            for (i, bucket) in buckets.load(Relaxed, &guard).unwrap().iter().enumerate() {
-                println!("bucket {}", i);
-                bucket.dbg_print_main();
-            }
-        };
-        println!("main array, len {}",
-                 self.buckets.load(Relaxed, &guard).unwrap().len());
-        print_bucket_array(&self.buckets);
-        print!("prev array, ");
-        if let Some(prev_buckets) = self.prev_buckets.load(Relaxed, &guard) {
-            println!("len {}", prev_buckets.len());
-            print_bucket_array(&self.prev_buckets);
-        } else {
-            println!("(None)");
-        }
-    }
-}
-
 impl<K: Eq + Hash + Clone, V: Clone> HashTable<K, V> {
     /// creates and initializes a new array of buckets.
     fn make_buckets(num_buckets: usize) -> Owned<Vec<LazySet<K, V>>> {
@@ -497,7 +474,7 @@ impl<K: Eq + Hash + Clone, V: Clone> HashTable<K, V> {
     fn get_bucket<'a>(buckets: Shared<'a, Vec<LazySet<K, V>>>,
                       key: &K)
                       -> (usize, &'a LazySet<K, V>) {
-        // TODO return an option for the bucket in the old arra
+        // TODO return an option for the bucket in the old array
         let mut hasher = fnv::FnvHasher::default();
         key.hash(&mut hasher);
         let hash = hasher.finish() as usize;
@@ -536,11 +513,6 @@ impl<K: Eq + Hash + Clone, V: Clone> HashTable<K, V> {
             LookupResult::Found(n) => Some(n),
             LookupResult::Deleted => None,
             LookupResult::NotFound => {
-                // TODO: do we need to retry here for linearizability? Worry is that we read
-                // prev_buckets as null after backfilling completes, but read buckets without all
-                // backfilled nodes (note: _pretty sure_ this is impossible), thereby missing
-                // something. Would only need one retry because any future growing operations would
-                // complete after guard is dropped.
                 if let Some(buckets) = self.prev_buckets.load(Relaxed, &guard) {
                     let (hash, bucket) = HashTable::get_bucket(buckets, key);
                     if let LookupResult::Found(elt) = bucket.lookup_stamped(hash, key, guard) {
@@ -667,69 +639,7 @@ fn print_loop<'a, T: Debug>(p: &Atomic<Segment<T>>, g: &'a Guard) {
     }
 }
 
-/// Some debugging routines for LazySet, these print and check some invariants.
-impl<K: Eq + Hash + Clone + Debug, V: Debug> LazySet<K, V> {
-    // prints detailed information about the main path of a segment,
-    pub fn dbg_print_main(&self) {
-        let guard = epoch::pin();
-        println!("Main seglist:");
-        print_loop(&self.head, &guard);
-    }
 
-    pub fn check_decreasing<F>(&self, msg: F)
-        where F: Fn()
-    {
-        let guard = epoch::pin();
-        let mut cur = self.head.load(Relaxed, &guard);
-        let mut prev_seg = isize::MAX;
-        while let Some(seg) = cur {
-            let s_id = seg.id.load(Relaxed);
-            if prev_seg >= 0 && prev_seg <= s_id {
-                msg();
-            }
-            prev_seg = s_id;
-            cur = seg.next.load(Relaxed, &guard);
-        }
-    }
-
-    pub fn consistency_check(&self) {
-        let guard = epoch::pin();
-        let mut h = VecSet::new();
-        let mut v = Vec::new();
-        let mut shadow = Vec::new();
-        let mut cur_seg = &self.head;
-        loop {
-            let ptr = cur_seg.ptr.load(Relaxed) as usize;
-            if ptr == 0 {
-                break;
-            }
-            let (_next, snapshot) = dbg_print(cur_seg, &guard);
-            if h.contains(&ptr) {
-                shadow.push((ptr, snapshot.clone()));
-            } else {
-                h.insert(ptr);
-            }
-            v.push((ptr, snapshot));
-            if shadow.len() > 10 {
-                break;
-            }
-            match cur_seg.load(Relaxed, &guard) {
-                Some(seg) => cur_seg = &seg.next,
-                None => break,
-            }
-        }
-        if shadow.len() > 10 {
-            if !self.die.compare_and_swap(false, true, Relaxed) {
-                let s: Vec<String> = shadow.iter().map(|t| format!("{}", t.0)).collect();
-                println!("Saw the following multiple times: {}", s.join(","));
-                println!("What this check saw:");
-                for (_i, vec) in v {
-                    println!("{}", vec.join(""));
-                }
-            }
-        }
-    }
-}
 impl<K: Eq + Hash + Clone, V> LazySet<K, V> {
     pub fn iter_live<'a>(&self,
                          ord: Ordering,
@@ -905,12 +815,6 @@ impl<K: Eq + Hash + Clone, V> LazySet<K, V> {
     /// `start_deleted` is true then the record is immediately marked as deleted, which serves as a
     /// removal operation if there is a concurrent grow occurring. `vec` is thread-local data used
     /// to cache segment allocations.
-    ///
-    /// TODO: there is a small bug here where there can be a bunch of removes concurrent with a
-    /// grow operation that occur before the backfill in `rebucket` completes. If this happens and
-    /// there is a concurrent `cleanup` operation, it is possible to lose a set of deletion
-    /// records. The solution here is to pass an additional flag to add_opt indicating if there may
-    /// be concurrent backfills, and to simply not call cleanup if that is the case.
     fn add_opt(&self,
                hash: usize,
                key: K,
@@ -1277,36 +1181,6 @@ impl<T> Segment<T> {
         SegCursorDerefItems(self.iter_raw(ord, guard))
     }
 
-
-
-    /// Search traverses a segment in reverse order and returns a reference to the first MarkedCell
-    /// it finds matching pred, if there is one. This does most of the algorithmic heavy-lifting of
-    /// the LazySet lookup operation. If the first one it finds has been deleted, then it returns
-    /// None as well.
-    #[inline]
-    fn search<'a, 'b: 'a, F>(&'a self,
-                             g: &'b Guard,
-                             hash: usize,
-                             mut pred: F)
-                             -> LookupResult<&'a MarkedCell<T>>
-        where F: FnMut(&T) -> bool
-    {
-        for cell in self.iter_raw(Relaxed, g) {
-            if cell.stamp.matches(hash, Relaxed) {
-                if let Some(data) = cell.data.load(Relaxed, g) {
-                    if pred(&*data) {
-                        return if cell.stamp.is_deleted(Relaxed) {
-                            LookupResult::Deleted
-                        } else {
-                            LookupResult::Found(cell)
-                        };
-                    }
-                }
-            }
-        }
-        return LookupResult::NotFound;
-    }
-
     /// new allocates a new segment, it initializes the memory in the 'data' member for a segment
     /// with deleted set to false and data set to null.
     fn new<'a>(id: isize, next: Option<Shared<'a, Segment<T>>>) -> Segment<T> {
@@ -1408,7 +1282,6 @@ mod tests {
 
     #[test]
     fn passing_segments_single_threaded_dcache() {
-        // TODO: easy fix: just don't remove deleted segments if growing is in progress
         let l = LazySet::new();
         for k in 0..(SEG_SIZE * 3 + 1) {
             l.add(k, k + 1);
@@ -1770,3 +1643,92 @@ mod tests {
         assert!(all_good);
     }
 }
+
+/// Some debugging routines for LazySet, these print and check some invariants.
+impl<K: Eq + Hash + Clone + Debug, V: Debug> LazySet<K, V> {
+    // prints detailed information about the main path of a segment,
+    pub fn dbg_print_main(&self) {
+        let guard = epoch::pin();
+        println!("Main seglist:");
+        print_loop(&self.head, &guard);
+    }
+
+    pub fn check_decreasing<F>(&self, msg: F)
+        where F: Fn()
+    {
+        let guard = epoch::pin();
+        let mut cur = self.head.load(Relaxed, &guard);
+        let mut prev_seg = isize::MAX;
+        while let Some(seg) = cur {
+            let s_id = seg.id.load(Relaxed);
+            if prev_seg >= 0 && prev_seg <= s_id {
+                msg();
+            }
+            prev_seg = s_id;
+            cur = seg.next.load(Relaxed, &guard);
+        }
+    }
+
+    pub fn consistency_check(&self) {
+        let guard = epoch::pin();
+        let mut h = VecSet::new();
+        let mut v = Vec::new();
+        let mut shadow = Vec::new();
+        let mut cur_seg = &self.head;
+        loop {
+            let ptr = cur_seg.ptr.load(Relaxed) as usize;
+            if ptr == 0 {
+                break;
+            }
+            let (_next, snapshot) = dbg_print(cur_seg, &guard);
+            if h.contains(&ptr) {
+                shadow.push((ptr, snapshot.clone()));
+            } else {
+                h.insert(ptr);
+            }
+            v.push((ptr, snapshot));
+            if shadow.len() > 10 {
+                break;
+            }
+            match cur_seg.load(Relaxed, &guard) {
+                Some(seg) => cur_seg = &seg.next,
+                None => break,
+            }
+        }
+        if shadow.len() > 10 {
+            if !self.die.compare_and_swap(false, true, Relaxed) {
+                let s: Vec<String> = shadow.iter().map(|t| format!("{}", t.0)).collect();
+                println!("Saw the following multiple times: {}", s.join(","));
+                println!("What this check saw:");
+                for (_i, vec) in v {
+                    println!("{}", vec.join(""));
+                }
+            }
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone + Debug, V: Clone + Debug> HashTable<K, V> {
+    /// debugging routine that prints the internal layout of `self`.
+    pub fn dbg_print_main(&self) {
+        let guard = epoch::pin();
+        let print_bucket_array = |buckets: &Atomic<Vec<LazySet<K, V>>>| {
+            for (i, bucket) in buckets.load(Relaxed, &guard).unwrap().iter().enumerate() {
+                println!("bucket {}", i);
+                bucket.dbg_print_main();
+            }
+        };
+        println!("main array, len {}",
+                 self.buckets.load(Relaxed, &guard).unwrap().len());
+        print_bucket_array(&self.buckets);
+        print!("prev array, ");
+        if let Some(prev_buckets) = self.prev_buckets.load(Relaxed, &guard) {
+            println!("len {}", prev_buckets.len());
+            print_bucket_array(&self.prev_buckets);
+        } else {
+            println!("(None)");
+        }
+    }
+}
+
+
